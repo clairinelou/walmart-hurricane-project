@@ -55,7 +55,7 @@ Our notebook is an end-to-end data pipeline and analysis of Walmart sales across
 | `README.md` | This file |
 | `inventory_and_sales.db` | SQLite database, downloaded automatically on the first run |
 
-> **Note on weather caching:** the notebook defines a cache filename (`weather_orlando_2024-09-01_2024-09-30.csv`), but the fallback copy of the Orlando weather data is actually stored directly inside the notebook as the `FALLBACK` table (see [Weather integration](#4-weather-integration)). No cache file needs to exist for the notebook to run.
+> **Note on weather caching:** if the Open-Meteo API fails, the notebook loads a saved copy of the weather for every store (`weather_by_store_2024-09-01_2024-09-30.csv`) from the `data` folder of our GitHub repository (see [Weather integration](#4-weather-integration)). Nothing needs to be saved locally for the notebook to run.
 
 ---
 
@@ -97,7 +97,7 @@ matplotlib
 requests
 ```
 
-`sqlite3`, `pathlib`, `re`, `os`, and `time` are part of the standard library.
+`sqlite3`, `pathlib`, `re`, and `time` are part of the standard library.
 
 ### Running in Google Colab
 
@@ -126,9 +126,9 @@ Each dataset has its own cleaning functions, and every decision is noted in a de
 | **Distribution centers** | `surge_capacity` stored as text (Miami listed as `~750`), converted to numeric with an approximate flag; Birmingham's missing shipment cost left as missing; no duplicate rows found |
 | **Store locations** | Mixed ID formats and state labels (`FL`, `Florida`, `Fla.`); ZIP codes stored as text; duplicate Orlando and Kissimmee stores removed (14 → 12 stores); Tallahassee's missing coordinates flagged |
 | **Inventory** | 626 missing `units_on_order` values kept as missing; 355 rows with 4 unmapped SKUs kept and flagged (see below); all store IDs matched the locations table, with no negative or fractional quantities, missing dates, or repeated date/store/SKU combinations |
-| **Daily sales** | Mixed date formats (`2024-09-12` vs `20240912`); category labels standardized to match the product catalog; 76 fractional unit totals and 34 negative revenues flagged, not altered. A separate `sales_revenue_valid` subset excludes negative and missing revenues for any revenue calculations |
+| **Daily sales** | Mixed date formats (`2024-09-12` vs `20240912`, 218 rows reformatted); category labels standardized to match the product catalog; 76 fractional unit totals and 34 negative revenues flagged (`total_units_fractional`, `total_revenue_negative`), not altered |
 
-**Unmapped inventory SKUs:** four inventory SKUs do not appear in the product catalog: `UNKNOWN-99` (91 rows), `LEGACY-PT` (90), `OLD-BATT-50` (90), and `MISC-001` (84). We searched every column of every table in the SQLite database for these codes and found nothing that identifies them, so we left them unmapped and out of the category map rather than guess their category. They are excluded from product-level comparisons that need a verified mapping.
+**Unmapped inventory SKUs:** four inventory SKUs do not appear in the product catalog: `UNKNOWN-99` (91 rows), `LEGACY-PT` (90), `OLD-BATT-50` (90), and `MISC-001` (84). They are not in the product catalog or the transactions, so there is no way to tell what product they are. We left them unmapped and flagged them with `sku_unmapped` rather than guess their category.
 
 ### 3. SKU consolidation
 
@@ -138,14 +138,11 @@ Different pack sizes within a product family (for example Pop-Tarts 4-pack vs. 6
 
 ### 4. Weather integration
 
-`daily_weather()` calls the Open-Meteo API with retry and backoff for rate limits and server errors (codes 429, 500, 502, 503, 504, plus timeouts and connection errors), waiting 2 and then 4 seconds between attempts. If the API still fails, the notebook falls back to `FALLBACK`, a copy of the Orlando September 1–30 Open-Meteo data written directly into the notebook, so it can run without wifi. A `source` column records which version was used, and the notebook checks that the API data matches the saved copy.
+`daily_weather()` calls the Open-Meteo API with retry and backoff for rate limits and server errors (codes 429, 500, 502, 503, 504, plus timeouts and connection errors), waiting 2 and then 4 seconds between attempts, up to three tries.
 
-The weather work is built in two stages:
+Weather is pulled for each of the 11 stores with coordinates (Tallahassee is skipped), using the store's coordinates and local time zone (Pensacola uses Central Time; the rest are Eastern), with a half-second pause between requests. The results are stacked into `weather_by_store`. If the API still fails, the notebook loads the saved copy from our GitHub repository instead. A `source` column records which version was used (`open-meteo` or `saved copy`). Asserts confirm there are no duplicate store/date rows, every store has weather, and every store has all 30 days.
 
-1. **Orlando first (store FL-239, 28.54°N, 81.38°W, Eastern time).** Orlando's transactions are converted to local dates and joined to the weather table in two analysis tables: unique orders per day vs. weather, and units per category per day vs. weather. Both merges are validated (`one_to_one` and `many_to_one`) and asserted to preserve row counts and unit totals. All 30 days of September had both sales and weather, with none missing.
-2. **All stores with coordinates.** Weather is pulled per store using the store's coordinates and local time zone (Pensacola uses Central Time; the rest are Eastern), with a half-second pause between requests. The results are stacked into `weather_by_store`, with an assert that each store has one weather row per day.
-
-Sales timestamps have no time zone attached, so they are assumed to be store-local.
+In Q3, daily sales per store and category are joined to `weather_by_store` with a `many_to_one` merge, and asserts confirm the merge did not change the row count or total units. Sales timestamps have no time zone attached, so they are assumed to be store-local (every time zone's sales run from 6 AM to 10 PM local time).
 
 ### 5. Decision log
 
@@ -189,22 +186,24 @@ Lag analysis shifts the weather from 7 days earlier to 7 days later (within each
 | Max wind speed | +4 | 0.35 | 0.27 |
 | Mean pressure | −6 | −0.51 | −0.39 |
 
+An event-timing check also finds, for each store, the first day after the baseline when sales rose more than 2 standard deviations above normal, and the first day wind rose, pressure dropped, or rain rose by the same amount.
+
 Tallahassee (FL-619) is excluded because it has no coordinates.
 
 **Interpretation:**
 
-- **Same-day relationships are weak to moderate** (none stronger than about ±0.4). Pressure had the strongest same-day correlation (-0.39), followed by precipitation (-0.31) and wind (+0.27). Falling pressure and rising wind go with higher sales, while heavy rain goes with lower sales.
-- **Storm-prep categories responded most.** Pressure was negatively correlated with sales in nine of the ten categories. Emergency and Breakfast (both −0.38 with pressure), Entertainment (−0.29), and Electronics (−0.27) matched the categories that surged in Q1. Wind was positively correlated in every category (mostly +0.22 to +0.27), and precipitation was negatively correlated in every category. Baby responded weakly, and Snacks showed almost no relationship with any indicator (−0.07, +0.04, +0.01).
-- **Wind peaks at a +4 day lag**, meaning sales rose in the days *before* the winds picked up. Pressure is strongest at +1 to +3 days (about −0.42), which points the same way.The timing is consistent with shoppers preparing ahead of the storm, but the analysis cannot tell whether forecasts influenced their purchases. 
-- **Precipitation peaks at a −4 day lag**, meaning sales were low in the days after heavy rain, which fits shopping dropping off once the storm passed.
-- **Treat the pressure peak at −6 days with caution.** It is hard to explain as real customer behavior (the −5 day lag is nearly identical at −0.51).
-- **For Walmart:** falling pressure and rising wind forecasts can act as early restocking triggers for Emergency, Breakfast, Entertainment, and Electronics, and sales should be expected to drop after landfall, so avoid over-ordering for those days.
+- **Same-day relationships are weak to moderate** (none stronger than ±0.4). Pressure had the strongest same-day correlation (−0.39), followed by precipitation (−0.31) and wind (+0.27). Sales were higher on lower-pressure and windier days.
+- **Storm-prep categories responded most.** Pressure was negatively correlated with sales in nine of the ten categories. Emergency and Breakfast (both −0.38 with pressure), Entertainment (−0.29), and Electronics (−0.27) matched the categories that surged in Q1. Wind was positively correlated in every category (mostly +0.15 to +0.27). Baby responded weakly, and Snacks showed almost no relationship with any indicator (−0.07, +0.04, +0.01).
+- **Precipitation was negative in every category (−0.07 to −0.30)**, likely a timing coincidence: the peak shopping week (Sept 19–24) was very dry, and the heaviest rain came with landfall, after stocking up had ended.
+- **Sales came before the weather.** At every store, sales first jumped above normal on September 16 or 17, while wind and pressure mostly did not change until September 25 or 26, so sales led by 9–10 days. Even the earliest weather changes (wind at Kissimmee on the 21st, pressure at Miami and Fort Myers on the 20th) came at least 4 days after sales jumped. Rain only jumped above normal at 5 stores, so it is not a focus. Shoppers were likely reacting to forecasts and news, not to the weather they were seeing.
+- **The lag correlations support this but show no single clear peak.** Wind turns positive after lag −2 and peaks at +4 days (+0.35), so high-sales days came before windy days. The negative-lag peaks for pressure (−6 days) and precipitation (−4 days) don't mean weather came first: they pair the surge days with the dry, high-pressure days before the storm, and the post-landfall sales drop with the storm's low pressure and heavy rain.
+- **For Walmart:** local weather readings arrive too late to trigger restocking. Use storm forecasts instead, and stock Emergency, Breakfast, Entertainment, and Electronics at least 10 days before expected landfall. Sales should be expected to drop after landfall, so avoid over-ordering for those days.
 
-**Caveats:** these results come from one storm over 30 days, so some correlations may reflect the timeline of the month rather than cause and effect. We explored Orlando further to stay consistent with class material (the 10/21 Studio Notebook), but it is about 200 miles from the landfall site and only felt the edge of the storm, so correlations may understate the response at landfall. The lags should be confirmed across more storms before being used for store decisions.
+**Caveats:** these results come from one storm over 30 days, so some correlations may reflect the timeline of the month rather than cause and effect. All stores share the same days and the same storm, so store-days are not independent observations. Most stores were far from the landfall site, so correlations may understate the response closer to landfall. The lags should be confirmed across more storms before being used for store decisions.
 
 ### Q4: Store-level geographic patterns
 
-Each store's distance to Helene's *predicted* path was compared with surge size and timing. We use the predicted path (NHC Forecast Advisory 9) rather than the actual one because we used the forecast track to measure store distance from the predicated path before landfall. The forecast only gives a few points, so the notebook fills in 100 evenly spaced points between each pair and measures each store's distance (using the haversine formula) to the closest point on that line. Distance to the actual landfall point is also calculated for reference.
+Each store's distance to Helene's *predicted* path was compared with surge size and timing. We use the forecast track from NHC Forecast Advisory 9 (Sept 25) to measure each store's distance from the predicted path. The forecast only gives a few points, so the notebook fills in 100 evenly spaced points between each pair and measures each store's distance (using the haversine formula) to the closest point on that line. Distance to the actual landfall point is also calculated for reference.
 
 How the surge measures were defined:
 
@@ -216,36 +215,41 @@ How the surge measures were defined:
 Results:
 
 - Distance vs. % increase: Spearman r = **0.05** (essentially no relationship)
+- Distance to actual landfall vs. % increase: Spearman r = **0.02**
 - Distance vs. days of early warning: Spearman r = **−0.45**
 - Outlier stores flagged: **Orlando** and **Miami**
 
 **Interpretation:**
 
-- Stores closer to the predicted path did **not** surge more. Ten of the 12 stores fell between +137% and +152%. Gainesville, the closest store (137 miles), had one of the smaller surges (+138%), while Miami, the farthest (330 miles), had the largest (+171%). Using distance to the landfall point instead of the predicted path gave the same result.
-- Surge timing varied little across stores: the estimated start dates were only one day apart. Every store except Kissimmee and Daytona Beach began surging on September 16th (10 days before landfall); those two started on the 17th. Every store peaked on September 24th or 25th. The −0.45 correlation comes from that single one-day difference and isn't very meaningful.
-- The estimated surge start dates preceded the September 25th advisory used to measure distance to the forecast path. The advisory does not tell us what information shoppers had when sales began rising. The per-store daily sales charts show nearly identical curves regardless of distance.
-- **Orlando** had the weakest surge (+122%), below the roughly +145% predicted from its distance (residual z = −2.26), and the lowest surge-week volume of any store (209.6 units/day). Possible explanations include stock-outs, competition from other stores, or lower perceived risk because it is inland. **Miami** had the strongest (+171%, z = +2.15), possibly because of its low baseline (86.9 units/day) or South Florida's hurricane experience. Tallahassee, excluded from the distance analysis, had the second-largest surge (+160%) and is the store closest to the actual landfall.
-- **For Walmart:** plan hurricane stocking statewide rather than store by store, and start as soon as a storm is perceived as a threat to Florida.
+- Stores closer to the predicted path did **not** surge more. Surges ranged from +122% to +171%, and nine of the 12 stores fell between +137% and +153%. Gainesville, the closest store (137 miles), had one of the smaller surges (+138%), while Miami, the farthest (330 miles), had the largest (+171%). Using distance to the landfall point instead of the predicted path gave the same result (r = 0.02).
+- Grouping stores by region showed the same pattern: every region's average surge fell between +136% and +152%, except South Florida (Miami only, +171%). Every region started surging 9–10 days before landfall and peaked 1–2 days before.
+- Surge timing varied little across stores: the estimated start dates were only one day apart. Every store except Kissimmee and Daytona Beach began surging on September 16th (10 days before landfall); those two started on the 17th. Every store peaked on September 24th or 25th. The −0.45 correlation depends on those two later stores, which happen to be farther from the path, so it reflects a single one-day difference and isn't meaningful.
+- The estimated surge start dates preceded the September 25th advisory used to measure distance to the forecast path. The per-store daily sales charts show nearly identical curves regardless of distance.
+- **Orlando** had the weakest surge (+122%), below the roughly +145% predicted from its distance (residual z = −2.26, a borderline outlier just past the cutoff of 2), and the lowest surge-week volume of any store (209.6 units/day). Possible explanations include stock-outs, competition from other stores, or less concern because it is inland. **Miami** had the strongest surge (+171%) and was flagged by surge size (z = +2.15), not by its residual (z = +1.23), because as the farthest store it pulls the fitted line toward itself. Its surge may reflect its low baseline (86.9 units/day) or its coastal location. Tallahassee, excluded from the distance analysis, had the second-largest surge (+160%) and is the store closest to the actual landfall.
+- **For Walmart:** large surges happened at both nearby and distant stores, so stock all stores, not only those near the predicted path.
 
 **Caveats:** only 11 stores have distances and there is a single storm, so one store like Miami can shift the results. Sales reflect what was sold, not true demand, since stock-outs can hide it. Adding Tallahassee's coordinates is the most useful next step.
 
 ### Q5: Signal vs. artifact (board games)
 
-The project prompt reports a 250% increase in Entertainment sales. This question is designed to test if that is true or artifact. 
+The project prompt reports a 250% increase in Entertainment sales. This question tests whether that is a real demand signal or a data artifact (SKU miscoding, category lumping, or reporting lag), using SQL queries against the SQLite database alongside the cleaned transactions.
 
 **Evidence:**
 
 | Check | What we found |
 |---|---|
-| **A. Transaction-level breakdown** | In the raw receipts, Monopoly rose only **28.3%** (608 → 780 units, baseline vs. surge) and Playing Cards actually fell **1.1%** (829 → 820). |
-| **B. Database vs. transactions** | For Sept 19–25, the summary database reports **9,761** Entertainment units while the transaction logs show about **1,600** (780 Monopoly + 820 Playing Cards), a gap of roughly **8,161** extra units. All **360 of 360** store-days mismatch. A daily bar chart (database vs. transactions) shows the gap visually. |
-| **C. Unmapped inventory codes** | Four inventory SKUs (`UNKNOWN-99`, `LEGACY-PT`, `OLD-BATT-50`, `MISC-001`) have no valid product mapping. Their on-hand counts swing erratically during the surge window (for example, `LEGACY-PT` jumps to 1,012 units on Sept 20), which is consistent with unreliable legacy records. |
+| **A. Transaction-level breakdown** | In the raw receipts, average daily units rose **156.6%** for Monopoly (43.4 → 111.4/day) and **97.8%** for Playing Cards (59.2 → 117.1/day), baseline vs. surge. Entertainment overall rose **122.7%**. |
+| **B. Database vs. transactions** | For Sept 19–25, the summary database reports **9,761.5** Entertainment units while the sampled transaction logs show **1,600** (780 Monopoly + 820 Playing Cards), a gap of **8,161.5** units. All **360 of 360** store-days mismatch, and every category has a gap of this kind (Breakfast's is the largest). A daily bar chart (database vs. transactions) shows the gap visually. |
+| **C. Growth in each source** | Using daily averages, Entertainment grew **144.4%** in the database and **122.7%** in the receipts. Neither source reaches +250%, but both show sales more than doubling. |
+| **D. Category lumping** | The database uses a single raw `Entertainment` label, but it doesn't show which products are grouped under it. |
+| **E. SKU miscoding** | All valid transactions have mapped SKUs (0 unmapped rows). Four inventory SKUs (`UNKNOWN-99`, `LEGACY-PT`, `OLD-BATT-50`, `MISC-001`) have no product mapping, and their on-hand counts swing erratically (for example, `LEGACY-PT` jumps to 1,012 units on Sept 20). Their stock fell by 3,864 units during the surge, but inventory decreases are not confirmed sales, so we can't tell how much of the gap they explain. |
+| **F. Reporting lag** | The database and receipt series match best with no time shift (r = 0.958), and no store-days are missing or zero, so there is no evidence of delayed or catch-up reporting. The database runs about 5.7× the receipts on average (6.1× during the surge, 5.5× outside it). |
 
-**Our reading:** the +250% looks like a **reporting artifact, not a demand signal**. Our explanation is that legacy SKUs with no valid category mapping were default-grouped into the Entertainment total by the legacy database system, inflating it. The notebook does not directly trace those SKUs into the Entertainment totals, so this is the most likely explanation, not a proven one.
+**Our reading:** Entertainment sales really did rise before the storm, but the +250% figure is not supported by either source. The gap between the database and the receipts is real, but we could not establish its cause: it could be a reporting error, unmapped SKUs, or simply the fact that the transaction file is a sample.
 
-**Recommendation:** Walmart should **not** stock extra board games for the next storm based on this surge. Ordering against the +250% figure would likely leave Walmart overstocked. That shelf space and budget would be better spent on categories with confirmed demand, such as Emergency supplies and Breakfast items (Pop-Tarts).
+**Recommendation:** Walmart should keep **normal stock levels** for board games and playing cards for the next storm rather than ordering against the +250% figure. Entertainment grew at a similar rate to Health and Alcohol, far less than Breakfast (+410%) and Emergency (+182%), so extra shelf space and budget should go to Emergency supplies and Breakfast items. Before increasing Entertainment orders, Walmart should check complete sales and inventory records to see whether stores ran out of board games or playing cards during the surge.
 
-**Caveats:** the transaction file is a sample (roughly 2,000 transactions per store), so it will undercount absolute volume relative to the database. The size of the gap is therefore partly a sampling effect, but the pattern still holds: the raw receipts show little to no board-game surge. Confirming with full point-of-sale data would settle this.
+**Caveats:** the transaction file is a sample (roughly 2,000 transactions per store), so it will undercount absolute volume relative to the database. We did not establish whether stores ran out of stock, and the data can't tell us why shoppers bought more.
 
 ---
 
@@ -255,8 +259,8 @@ The notebook ends with five written reflections. Short versions:
 
 1. **Data quality impact.** The Pop-Tarts appeared under four different SKUs. Consolidating them through the shared mapping table showed 5,005 units sold and a 678-unit peak on Sept 25. Without it, looking at any single SKU would have badly underestimated demand.
 2. **ETL trade-offs.** We left the 884 missing transaction timestamps as missing instead of filling them from neighboring rows. The rows are not in chronological order, so filling would have assigned wrong days and invented data we couldn't verify. The cost is that those transactions are excluded from daily totals.
-3. **Pipeline trust.** We agree that the pipeline is a bigger risk than the model. The most fragile part was the high-level database summary vs. the raw receipts (9,761 vs. about 1,600 Entertainment units), caused by unmapped legacy SKUs. Pop-Tarts split across four SKUs was the second most fragile piece.
-4. **Business vs. data.** We weighed the database's +250% figure against the receipt audit and recommended against stocking extra board games, since stocking up on an artifact would waste money and shelf space. With more time we would still recommend the same, but would audit the other categories to check whether the unmapped legacy codes belong to Breakfast or Emergency items.
+3. **Pipeline trust.** We agree that the pipeline is a bigger risk than the model. The most fragile part was the high-level database summary vs. the raw receipts (9,761.5 vs. 1,600 Entertainment units). We found unmapped legacy SKUs but could not verify whether they caused the difference, and since the transaction file is a sample, its totals may differ from the database even without a reporting error. Pop-Tarts split across four SKUs was another fragile piece.
+4. **Business vs. data.** We decided against increasing orders based solely on the reported +250% surge, since stocking up on the raw database figure could leave Walmart with too many games and take space from higher-priority products like Pop-Tarts and emergency supplies. Both sources still showed growth (122.7% in the sampled receipts), so with more time and complete sales records we would check whether a modest increase in board-game orders is justified, and audit the other categories to identify the unmapped SKUs and whether they affect category totals.
 5. **Team collaboration.** We planned the division of work in our team charter, but ended up cleaning the data together to better understand each part. With another week, we would agree on shared column names and the SKU mapping earlier to spend less time reconciling code.
 
 ---
